@@ -1,0 +1,248 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Dec  5 16:20:08 2022
+
+@author: camer
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+import pandas_datareader.data as web
+import yahoo_fin as yf
+from yahoo_fin import options as yo
+from yahoo_fin import stock_info as info
+from datetime import date
+from datetime import timedelta
+from datetime import datetime
+from sympy import symbols, diff
+from datetime import time
+from time import sleep
+import os
+
+# option date returned as string - changing to a datetime value
+def get_option_date(ticker): # should change this to include multiple expiration dates
+    try:
+        string = yo.get_expiration_dates(ticker)[1]
+        dct = {'January': 1, 'February': 2, 'March': 3, 'April': 4, 'May': 5, 'June': 6, 'July' : 7
+                    , 'August': 8, 'September': 9, 'October': 10, 'November': 11, 'December': 12}
+        for month in dct:
+            if month in string:
+                _month = dct[month]
+                #print(_month)
+                for year in ['2022', '2023', '2024', '2025']:
+                    if year in string:
+                        _year = year
+                        #print(_year)
+                        for day in range(0, 31):
+                            if month + ' ' + str(day) + ',' + ' ' + year == string:
+                                _day = day
+                                #print(_day)
+        return date(int(_year), int(_month), int(_day))
+    except IndexError:
+        print(f'Unable to locate options chain for {ticker}')
+
+# getting annualized volatility
+def annual_vol(ticker):
+    start = date.today() - timedelta(days = 366) # extra day - to get 252 days of data
+    end = date.today()
+    data = info.get_data(ticker, start_date = start, end_date = end, index_as_date = False)
+    close = data['adjclose'].pct_change()
+    close = close.drop(0)
+    annual_vol = np.sqrt(np.var(close)) * np.sqrt(252)
+    return annual_vol
+
+# getting implied volatility
+def get_implied_vol(ticker, strike, struct='calls'):
+    try:
+        data = yo.get_options_chain(ticker, get_option_date(ticker))
+        if struct == 'calls':
+            data = data['calls']
+            i = 0
+            vol = None
+            for row in data['Strike']:
+                if row == strike:
+                    vol = data['Implied Volatility'][i]
+                    vol = vol[:(len(vol)-1)]
+                i += 1
+            if vol == None:
+                raise ValueError('Invalid strike price, no quoted data available')
+                
+        elif struct == 'puts':
+            data = data['puts']
+            i = 0
+            vol = None
+            for row in data['Strike']:
+                if row == strike:
+                    vol = data['Implied Volatility'][i]
+                    vol = vol[:(len(vol)-1)]
+                    i += 1
+            if vol == None:
+                raise ValueError('Invalid strike price, no quoted data available')
+        return float(vol)/100
+    except ValueError:
+        pass
+
+def dividends(ticker):
+    """ only handling short term options for simplicity, so not considering more than 1 div"""
+    div = info.get_dividends(ticker, start_date = date.today(), end_date = get_option_date(ticker), index_as_date = False)
+    if div.empty:
+        return 0
+    else:
+        div = div[0]['dividend']
+        return div
+
+def get_risk_free():
+    return 4.67
+
+def get_actual_price(ticker, strike, struct):
+    try:
+        data = yo.get_options_chain(ticker, get_option_date(ticker))
+        if struct == 'calls':
+            data = data['calls']
+            i = 0
+            price = None
+            for row in data['Strike']:
+                if row == strike:
+                    bid = data['Bid'][i]
+                    ask = data['Ask'][i]
+                    price = (bid + ask)/2
+                i += 1
+            if price == None:
+                raise ValueError('Invalid strike price, no quoted data available')
+                
+        elif struct == 'puts':
+            data = data['puts']
+            i = 0
+            price = None
+            for row in data['Strike']:
+                if row == strike:
+                    bid = data['Bid'][i]
+                    ask = data['Ask'][i]
+                    price = (bid + ask)/2
+                i += 1
+            if price == None:
+                raise ValueError('Invalid strike price, no quoted data available')
+        return price, bid, ask
+    except ValueError:
+        print(f'Tables not found for {ticker} {struct} at strike = {strike}')
+        pass
+
+# Theoretical Black-Scholes Valuation for closest option, using implied volatility from Yahoo Finance
+class BsOption:
+    def __init__(self, ticker, K, cp, q=0):
+        self.cp = cp
+        self.S = info.get_live_price(ticker)
+        self.K = K
+        self.T = ((get_option_date(ticker) - date.today()).days)/365 # need a more accurate time measure to account for time passed in day
+        self.r = get_risk_free()/100 # need a good resource for live risk_free data
+        self.sigma = get_implied_vol(ticker, self.K, cp)
+        self.q = dividends(ticker)
+        self.actual_price = get_actual_price(ticker, self.K, cp)
+        
+    
+    @staticmethod
+    def N(x):
+        return norm.cdf(x)
+    
+    @property
+    def params(self):
+        return {'S': self.S, 
+                'K': self.K, 
+                'T': self.T, 
+                'r':self.r,
+                'q':self.q,
+                'sigma':self.sigma}
+    
+    def d1(self):
+        return (np.log(self.S/self.K) + ((self.r -self.q) + (self.sigma**2/2))*self.T)/ (self.sigma*np.sqrt(self.T))
+    
+    def d2(self):
+        return self.d1() - self.sigma*np.sqrt(self.T)
+    
+    def _call_value(self):
+        return self.S*np.exp(-self.q*self.T)*self.N(self.d1()) - (self.K*np.exp(-self.r*self.T) * self.N(self.d2()))
+                    
+    def _put_value(self):
+        return self.K*np.exp(-self.r*self.T) * self.N(-self.d2()) -(self.S*np.exp(-self.q*self.T)*self.N(-self.d1()))
+    
+    def price(self):
+        if self.cp == 'calls':
+            return self._call_value()
+        if self.cp == 'puts':
+            return self._put_value() 
+        else:
+            raise ValueError('Unrecognized type')   
+    def delta(self):
+        if self.cp == 'calls':
+            N = norm.cdf
+            return N(self.d1())
+        if self.cp == 'puts':
+            N = norm.cdf
+            return - N(-self.d1())
+    def vega(self):
+        N_p = norm.pdf
+        return self.S*np.sqrt(self.T)*N_p(self.d1())
+    def lower_bound(self):
+        if self.cp == 'calls':
+            a = self.S - (self.K*np.exp(-self.r*self.T))
+            return max(a, 0)
+        if self.cp == 'puts':
+            a = (self.K*np.exp(-self.r*self.T)) - self.S
+            return max(a, 0)
+    def put_call_parity(self):
+        p1 = self._put_value() + self.S
+        p2 = self._call_value() + self.K*np.exp(-self.r*self.T)
+        arb = p1 - p2
+        return arb
+        
+def accumulate_data(ticker, struct='calls'):
+    history = pd.DataFrame(columns = ['S', 'K', 'r', 'q', 'sigma', 'Date & Time'])
+    now = datetime.now() # updating time
+    
+    data = yo.get_options_chain(ticker, get_option_date(ticker))[struct]
+    if data.empty == True:
+        pass
+    else:
+        prices = data['Strike']
+        i = 0
+        while i < len(prices):
+            try: # need to improve this - runtime too long
+                option = BsOption(ticker, prices[i], struct)
+                data = option.params
+                data.update({'Type': struct})
+                data.update({'Stock Price': info.get_live_price(ticker)})
+                data.update({'Ticker': ticker})
+                data.update({'Date & Time': datetime.now()}) # time of quote
+                data.update({'Price': option.actual_price[0]}) # halfway between bid and ask
+                data.update({'BS Price': option.price()})
+                data.update({'Delta': option.delta()})
+                data.update({'Vega': option.vega()})
+                data.update({'Put-Call Differential': option.put_call_parity()})
+                data.update({'Lower Bound': option.lower_bound()})
+                    
+                history = history.append(data, ignore_index=True)
+                i += 5
+            except TypeError:
+                pass
+        return history
+        
+history = pd.DataFrame() # initializing an empty dataframe
+
+if __name__ == "__main__":
+    opn = time(9,30,0)
+    close = time(16,30,0)
+    now = datetime.now()
+    while opn < now.time() < close:
+        lst = ['MSFT']
+        for stock in lst:
+            print(stock)
+            calls = accumulate_data(stock)
+            print(calls)
+            puts = accumulate_data(stock, struct='puts')
+            print(puts)
+            if calls.empty != True:
+                history = history.append(calls, ignore_index=True)
+                history = history.append(puts, ignore_index=True)    
+    os.makedirs('"C:/Users/camer/OneDrive/Desktop/Coding"', exist_ok=True)  
+    history.to_csv('"C:/Users/camer/OneDrive/Desktop/Coding"')
